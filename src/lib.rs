@@ -118,44 +118,48 @@ pub struct SimpleTaskQueue<T> {
     status_map: Arc<DashMap<TaskId, TaskStatus>>,
     sender: Sender<Task<T>>,
     receiver: Receiver<Task<T>>,
-    keep_cleanup_running: Arc<AtomicBool>,
-    cleanup_thread: Option<JoinHandle<()>>,
+    keep_background_task_running: Arc<AtomicBool>,
+    background_task: Option<JoinHandle<()>>,
 }
 
 impl<T> SimpleTaskQueue<T> {
     pub fn new_with_capacity(capacity: usize) -> SimpleTaskQueue<T> {
         const DEFAULT_FINISHED_TASK_TTL: Duration = Duration::from_secs(60);
-        const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+        const DEFAULT_RUNNING_TASK_TIMEOUT: Duration = Duration::from_secs(60);
+        const DEFAULT_BACKGROUND_TASK_INTERVAL: Duration = Duration::from_secs(60);
 
-        SimpleTaskQueue::new_with_cleanup_config(
+        SimpleTaskQueue::new_with_background_task_config(
             capacity,
             DEFAULT_FINISHED_TASK_TTL,
-            DEFAULT_CLEANUP_INTERVAL,
+            DEFAULT_RUNNING_TASK_TIMEOUT,
+            DEFAULT_BACKGROUND_TASK_INTERVAL,
         )
     }
 
-    pub fn new_with_cleanup_config(
+    pub fn new_with_background_task_config(
         capacity: usize,
         finished_task_ttl: Duration,
-        cleanup_interval: Duration,
+        running_task_timeout: Duration,
+        background_task_interval: Duration,
     ) -> SimpleTaskQueue<T> {
         let (sender, receiver) = crossbeam::channel::bounded::<Task<T>>(capacity);
 
         let status_map = Arc::new(DashMap::new());
-        let keep_cleanup_running = Arc::new(AtomicBool::new(true));
-        let cleanup_thread = spawn_cleanup_thread(
+        let keep_background_task_running = Arc::new(AtomicBool::new(true));
+        let background_task = spawn_background_task(
             Arc::clone(&status_map),
-            Arc::clone(&keep_cleanup_running),
+            Arc::clone(&keep_background_task_running),
             finished_task_ttl,
-            cleanup_interval,
+            running_task_timeout,
+            background_task_interval,
         );
 
         SimpleTaskQueue {
             status_map,
             sender,
             receiver,
-            keep_cleanup_running,
-            cleanup_thread: Some(cleanup_thread),
+            keep_background_task_running,
+            background_task: Some(background_task),
         }
     }
 
@@ -220,18 +224,34 @@ impl<T> SimpleTaskQueue<T> {
     }
 }
 
-fn spawn_cleanup_thread(
+fn spawn_background_task(
     status_map: Arc<DashMap<TaskId, TaskStatus>>,
     keep_running: Arc<AtomicBool>,
     finished_task_ttl: Duration,
-    cleanup_interval: Duration,
+    running_task_timeout: Duration,
+    background_task_interval: Duration,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while keep_running.load(Ordering::Acquire) {
-            cleanup_finished_tasks(&status_map, now_millis(), finished_task_ttl);
-            thread::park_timeout(cleanup_interval);
+            run_background_task(
+                &status_map,
+                now_millis(),
+                finished_task_ttl,
+                running_task_timeout,
+            );
+            thread::park_timeout(background_task_interval);
         }
     })
+}
+
+fn run_background_task(
+    status_map: &DashMap<TaskId, TaskStatus>,
+    now_millis: i64,
+    finished_task_ttl: Duration,
+    running_task_timeout: Duration,
+) {
+    cleanup_finished_tasks(status_map, now_millis, finished_task_ttl);
+    fail_timed_out_running_tasks(status_map, now_millis, running_task_timeout);
 }
 
 fn cleanup_finished_tasks(
@@ -250,17 +270,39 @@ fn cleanup_finished_tasks(
     });
 }
 
+fn fail_timed_out_running_tasks(
+    status_map: &DashMap<TaskId, TaskStatus>,
+    now_millis: i64,
+    running_task_timeout: Duration,
+) {
+    let timeout_millis = duration_millis_i64(running_task_timeout);
+    status_map.retain(|_, task_status| {
+        if task_status.state() == TaskState::Running
+            && matches!(
+                task_status.running_at(),
+                Some(running_at) if running_at.saturating_add(timeout_millis) <= now_millis
+            )
+        {
+            task_status.state = TaskState::Failed;
+            task_status.finished_at = Some(now_millis);
+        }
+
+        true
+    });
+}
+
 fn duration_millis_i64(duration: Duration) -> i64 {
     duration.as_millis().min(i64::MAX as u128) as i64
 }
 
 impl<T> Drop for SimpleTaskQueue<T> {
     fn drop(&mut self) {
-        self.keep_cleanup_running.store(false, Ordering::Release);
+        self.keep_background_task_running
+            .store(false, Ordering::Release);
 
-        if let Some(cleanup_thread) = self.cleanup_thread.take() {
-            cleanup_thread.thread().unpark();
-            let _ = cleanup_thread.join();
+        if let Some(background_task) = self.background_task.take() {
+            background_task.thread().unpark();
+            let _ = background_task.join();
         }
     }
 }
@@ -501,9 +543,10 @@ mod tests {
 
     #[test]
     fn background_cleanup_removes_finished_tasks_after_ttl() {
-        let queue = SimpleTaskQueue::new_with_cleanup_config(
+        let queue = SimpleTaskQueue::new_with_background_task_config(
             1,
             Duration::from_millis(0),
+            Duration::from_secs(60),
             Duration::from_millis(1),
         );
         submit_task(&queue, "task-1").unwrap();
@@ -522,5 +565,62 @@ mod tests {
         }
 
         panic!("finished task status was not cleaned");
+    }
+
+    #[test]
+    fn background_task_marks_running_tasks_failed_after_timeout() {
+        let status_map = DashMap::new();
+        status_map.insert(
+            "old-running".to_string(),
+            TaskStatus {
+                state: TaskState::Running,
+                created_at: 0,
+                running_at: Some(100),
+                finished_at: None,
+            },
+        );
+        status_map.insert(
+            "recent-running".to_string(),
+            TaskStatus {
+                state: TaskState::Running,
+                created_at: 0,
+                running_at: Some(900),
+                finished_at: None,
+            },
+        );
+
+        fail_timed_out_running_tasks(&status_map, 1_100, Duration::from_millis(500));
+
+        let old_status = status_map.get("old-running").unwrap();
+        assert_eq!(old_status.state(), TaskState::Failed);
+        assert_eq!(old_status.finished_at(), Some(1_100));
+
+        let recent_status = status_map.get("recent-running").unwrap();
+        assert_eq!(recent_status.state(), TaskState::Running);
+        assert!(recent_status.finished_at().is_none());
+    }
+
+    #[test]
+    fn background_task_fails_timed_out_running_task() {
+        let queue = SimpleTaskQueue::new_with_background_task_config(
+            1,
+            Duration::from_secs(60),
+            Duration::from_millis(0),
+            Duration::from_millis(1),
+        );
+        submit_task(&queue, "task-1").unwrap();
+        let task = queue.pop_task().unwrap();
+
+        for _ in 0..100 {
+            let status = queue.get_task_status(task.id()).unwrap();
+            if status.state() == TaskState::Failed {
+                assert!(status.finished_at().is_some());
+                return;
+            }
+
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        panic!("running task was not marked failed after timeout");
     }
 }
