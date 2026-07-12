@@ -4,8 +4,8 @@
 - [x] task submit and consumption thread-safe
 - [x] deduplicate with task_id
 - [x] record task status 
-- [ ] auto back-pressure
-- [ ] support self-define type task
+- [x] auto back-pressure
+- [x] support self-define type task
 - [ ] single-process with multi-thread support and distributed mode (backend by redis)
 - [ ] timeout handle strategy
 - [ ] metrics and tracing

@@ -9,16 +9,16 @@ use thiserror::Error;
 pub type TaskId = String;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Task {
+pub struct Task<T> {
     id: TaskId,
-    payload: Vec<u8>,
+    payload: T,
 }
 
-impl Task {
-    pub fn new(id: impl Into<TaskId>, payload: impl Into<Vec<u8>>) -> Self {
+impl<T> Task<T> {
+    pub fn new(id: impl Into<TaskId>, payload: T) -> Self {
         Self {
             id: id.into(),
-            payload: payload.into(),
+            payload,
         }
     }
 
@@ -26,7 +26,7 @@ impl Task {
         &self.id
     }
 
-    pub fn payload(&self) -> &[u8] {
+    pub fn payload(&self) -> &T {
         &self.payload
     }
 }
@@ -93,27 +93,27 @@ pub enum TaskError {
     Disconnected,
 }
 
-pub trait TaskQueue {
-    fn submit_task(&self, task: Task) -> Result<(), TaskError>;
+pub trait TaskQueue<T> {
+    fn submit_task(&self, task: Task<T>) -> Result<(), TaskError>;
 
     fn get_task_status(&self, task_id: TaskId) -> Result<TaskStatus, TaskError>;
 
-    fn pop_task(&self) -> Option<Task>;
+    fn pop_task(&self) -> Option<Task<T>>;
 
     fn mark_task_success(&self, task_id: TaskId);
 
     fn mark_task_failed(&self, task_id: TaskId);
 }
 
-pub struct SimpleTaskQueue {
+pub struct SimpleTaskQueue<T> {
     status_map: DashMap<TaskId, TaskStatus>,
-    sender: Sender<Task>,
-    receiver: Receiver<Task>,
+    sender: Sender<Task<T>>,
+    receiver: Receiver<Task<T>>,
 }
 
-impl SimpleTaskQueue {
-    pub fn new_with_capacity(capacity: usize) -> SimpleTaskQueue {
-        let (sender, receiver) = crossbeam::channel::bounded::<Task>(capacity);
+impl<T> SimpleTaskQueue<T> {
+    pub fn new_with_capacity(capacity: usize) -> SimpleTaskQueue<T> {
+        let (sender, receiver) = crossbeam::channel::bounded::<Task<T>>(capacity);
         SimpleTaskQueue {
             status_map: DashMap::new(),
             sender,
@@ -121,12 +121,12 @@ impl SimpleTaskQueue {
         }
     }
 
-    pub fn new() -> SimpleTaskQueue {
+    pub fn new() -> SimpleTaskQueue<T> {
         const DEFAULT_CAPACITY: usize = 1024;
         SimpleTaskQueue::new_with_capacity(DEFAULT_CAPACITY)
     }
 
-    pub fn submit_task(&self, task: Task) -> Result<(), TaskError> {
+    pub fn submit_task(&self, task: Task<T>) -> Result<(), TaskError> {
         let task_id = task.id.clone();
 
         match self.status_map.entry(task_id.clone()) {
@@ -156,7 +156,7 @@ impl SimpleTaskQueue {
             .ok_or(TaskError::NotFound)
     }
 
-    pub fn pop_task(&self) -> Option<Task> {
+    pub fn pop_task(&self) -> Option<Task<T>> {
         match self.receiver.try_recv() {
             Ok(t) => {
                 if let Some(mut status) = self.status_map.get_mut(&t.id) {
@@ -189,14 +189,14 @@ fn finish_task(status: &mut TaskStatus, finished_state: TaskState) {
     }
 }
 
-impl Default for SimpleTaskQueue {
+impl<T> Default for SimpleTaskQueue<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TaskQueue for SimpleTaskQueue {
-    fn submit_task(&self, task: Task) -> Result<(), TaskError> {
+impl<T> TaskQueue<T> for SimpleTaskQueue<T> {
+    fn submit_task(&self, task: Task<T>) -> Result<(), TaskError> {
         SimpleTaskQueue::submit_task(self, task)
     }
 
@@ -204,7 +204,7 @@ impl TaskQueue for SimpleTaskQueue {
         SimpleTaskQueue::get_task_status(self, task_id)
     }
 
-    fn pop_task(&self) -> Option<Task> {
+    fn pop_task(&self) -> Option<Task<T>> {
         SimpleTaskQueue::pop_task(self)
     }
 
@@ -221,18 +221,22 @@ impl TaskQueue for SimpleTaskQueue {
 mod tests {
     use super::*;
 
-    fn task(id: &str) -> Task {
+    fn task(id: &str) -> Task<Vec<u8>> {
         Task {
             id: id.to_string(),
             payload: Vec::new(),
         }
     }
 
+    fn submit_task(queue: &SimpleTaskQueue<Vec<u8>>, id: &str) -> Result<(), TaskError> {
+        queue.submit_task(task(id))
+    }
+
     #[test]
     fn submit_task_sets_status_to_queued() {
         let queue = SimpleTaskQueue::new();
 
-        queue.submit_task(task("task-1")).unwrap();
+        submit_task(&queue, "task-1").unwrap();
 
         assert_eq!(
             queue.get_task_status("task-1".to_string()).unwrap().state(),
@@ -243,7 +247,7 @@ mod tests {
     #[test]
     fn pop_task_marks_status_as_running() {
         let queue = SimpleTaskQueue::new();
-        queue.submit_task(task("task-1")).unwrap();
+        submit_task(&queue, "task-1").unwrap();
 
         let task = queue.pop_task().unwrap();
 
@@ -257,7 +261,7 @@ mod tests {
     #[test]
     fn running_task_can_be_marked_success() {
         let queue = SimpleTaskQueue::new();
-        queue.submit_task(task("task-1")).unwrap();
+        submit_task(&queue, "task-1").unwrap();
 
         assert_eq!(
             queue.get_task_status("task-1".to_string()).unwrap().state(),
@@ -282,7 +286,7 @@ mod tests {
     #[test]
     fn running_task_can_be_marked_failed() {
         let queue = SimpleTaskQueue::new();
-        queue.submit_task(task("task-1")).unwrap();
+        submit_task(&queue, "task-1").unwrap();
 
         assert_eq!(
             queue.get_task_status("task-1".to_string()).unwrap().state(),
@@ -307,10 +311,10 @@ mod tests {
     #[test]
     fn submit_task_rejects_duplicate_id() {
         let queue = SimpleTaskQueue::new();
-        queue.submit_task(task("task-1")).unwrap();
+        submit_task(&queue, "task-1").unwrap();
 
         assert!(matches!(
-            queue.submit_task(task("task-1")),
+            submit_task(&queue, "task-1"),
             Err(TaskError::Duplicate)
         ));
 
@@ -323,10 +327,10 @@ mod tests {
     #[test]
     fn submit_task_rejects_when_queue_is_full_without_status_leak() {
         let queue = SimpleTaskQueue::new_with_capacity(1);
-        queue.submit_task(task("task-1")).unwrap();
+        submit_task(&queue, "task-1").unwrap();
 
         assert!(matches!(
-            queue.submit_task(task("task-2")),
+            submit_task(&queue, "task-2"),
             Err(TaskError::QueueFulled)
         ));
         assert!(matches!(
@@ -340,7 +344,7 @@ mod tests {
         let queue = SimpleTaskQueue::new();
         let before_submit = now_millis();
 
-        queue.submit_task(task("task-1")).unwrap();
+        submit_task(&queue, "task-1").unwrap();
 
         let status = queue.get_task_status("task-1".to_string()).unwrap();
         assert_eq!(status.state(), TaskState::Queued);
@@ -351,7 +355,7 @@ mod tests {
     #[test]
     fn successful_task_records_finished_at() {
         let queue = SimpleTaskQueue::new();
-        queue.submit_task(task("task-1")).unwrap();
+        submit_task(&queue, "task-1").unwrap();
         queue.pop_task().unwrap();
 
         queue.mark_task_success("task-1".to_string());
@@ -364,7 +368,7 @@ mod tests {
     #[test]
     fn failed_task_records_finished_at() {
         let queue = SimpleTaskQueue::new();
-        queue.submit_task(task("task-1")).unwrap();
+        submit_task(&queue, "task-1").unwrap();
         queue.pop_task().unwrap();
 
         queue.mark_task_failed("task-1".to_string());
