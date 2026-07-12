@@ -6,9 +6,12 @@
 - [x] record task status 
 - [x] auto back-pressure
 - [x] support self-define type task
-- [ ] single-process with multi-thread support and distributed mode (backend by redis)
-- [ ] timeout handle strategy
+- [x] completed task status will be cleaned if reach ttl
+- [ ] single-process with multi-thread support and distributed mode (backend by redis / postgre / mysql)
+- [ ] zombie task detection
 - [ ] metrics and tracing
+- [ ] task with priority
+- [ ] task cancelation
 
 ### Benchmark
 
