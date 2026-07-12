@@ -1,13 +1,32 @@
+use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
-use std::collections::LinkedList;
+use dashmap::mapref::entry::Entry;
 use thiserror::Error;
 
 // identify an unique task, task with same TaskId will be reject when submit
-type TaskId = String;
+pub type TaskId = String;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Task {
     id: TaskId,
     payload: Vec<u8>,
+}
+
+impl Task {
+    pub fn new(id: impl Into<TaskId>, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            id: id.into(),
+            payload: payload.into(),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -26,50 +45,57 @@ pub enum TaskError {
     Duplicate,
 }
 
-trait TaskQueue {
-    fn submit_task(&mut self, task: Task) -> Result<(), TaskError>;
+pub trait TaskQueue {
+    fn submit_task(&self, task: Task) -> Result<(), TaskError>;
 
     fn get_task_status(&self, task_id: TaskId) -> Result<TaskState, TaskError>;
 
-    fn pop_task(&mut self) -> Option<Task>;
+    fn pop_task(&self) -> Option<Task>;
 
-    fn mark_task_success(&mut self, task_id: TaskId);
+    fn mark_task_success(&self, task_id: TaskId);
 
-    fn mark_task_failed(&mut self, task_id: TaskId);
+    fn mark_task_failed(&self, task_id: TaskId);
 }
 
-struct SimpleTaskQueue {
+pub struct SimpleTaskQueue {
     status_map: DashMap<TaskId, TaskState>,
-    wait_list: LinkedList<Task>,
+    wait_queue: SegQueue<Task>,
 }
 
-impl TaskQueue for SimpleTaskQueue {
-    fn submit_task(&mut self, task: Task) -> Result<(), TaskError> {
-        if self.status_map.contains_key(&task.id) {
-            Err(TaskError::Duplicate)
-        } else {
-            let task_id = task.id.clone();
-            self.status_map.insert(task_id.clone(), TaskState::Queued);
-            self.wait_list.push_back(task);
-            Ok(())
+impl SimpleTaskQueue {
+    pub fn new() -> SimpleTaskQueue {
+        SimpleTaskQueue {
+            status_map: DashMap::new(),
+            wait_queue: SegQueue::new(),
         }
     }
 
-    fn get_task_status(&self, task_id: TaskId) -> Result<TaskState, TaskError> {
+    pub fn submit_task(&self, task: Task) -> Result<(), TaskError> {
+        match self.status_map.entry(task.id.clone()) {
+            Entry::Occupied(_) => Err(TaskError::Duplicate),
+            Entry::Vacant(entry) => {
+                entry.insert(TaskState::Queued);
+                self.wait_queue.push(task);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn get_task_status(&self, task_id: impl AsRef<str>) -> Result<TaskState, TaskError> {
         self.status_map
-            .get(&task_id)
+            .get(task_id.as_ref())
             .map(|state| *state)
             .ok_or(TaskError::NotFound)
     }
 
-    fn pop_task(&mut self) -> Option<Task> {
-        self.wait_list.pop_front().inspect(|t| {
+    pub fn pop_task(&self) -> Option<Task> {
+        self.wait_queue.pop().inspect(|t| {
             self.status_map.insert(t.id.clone(), TaskState::Running);
         })
     }
 
-    fn mark_task_success(&mut self, task_id: TaskId) {
-        self.status_map.alter(&task_id, |_key, old_state| {
+    pub fn mark_task_success(&self, task_id: impl AsRef<str>) {
+        self.status_map.alter(task_id.as_ref(), |_key, old_state| {
             if old_state == TaskState::Running {
                 TaskState::Success
             } else {
@@ -78,8 +104,8 @@ impl TaskQueue for SimpleTaskQueue {
         });
     }
 
-    fn mark_task_failed(&mut self, task_id: TaskId) {
-        self.status_map.alter(&task_id, |_key, old_state| {
+    pub fn mark_task_failed(&self, task_id: impl AsRef<str>) {
+        self.status_map.alter(task_id.as_ref(), |_key, old_state| {
             if old_state == TaskState::Running {
                 TaskState::Failed
             } else {
@@ -89,16 +115,37 @@ impl TaskQueue for SimpleTaskQueue {
     }
 }
 
+impl Default for SimpleTaskQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaskQueue for SimpleTaskQueue {
+    fn submit_task(&self, task: Task) -> Result<(), TaskError> {
+        SimpleTaskQueue::submit_task(self, task)
+    }
+
+    fn get_task_status(&self, task_id: TaskId) -> Result<TaskState, TaskError> {
+        SimpleTaskQueue::get_task_status(self, task_id)
+    }
+
+    fn pop_task(&self) -> Option<Task> {
+        SimpleTaskQueue::pop_task(self)
+    }
+
+    fn mark_task_success(&self, task_id: TaskId) {
+        SimpleTaskQueue::mark_task_success(self, task_id);
+    }
+
+    fn mark_task_failed(&self, task_id: TaskId) {
+        SimpleTaskQueue::mark_task_failed(self, task_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn queue() -> SimpleTaskQueue {
-        SimpleTaskQueue {
-            status_map: DashMap::new(),
-            wait_list: LinkedList::new(),
-        }
-    }
 
     fn task(id: &str) -> Task {
         Task {
@@ -109,7 +156,7 @@ mod tests {
 
     #[test]
     fn submit_task_sets_status_to_queued() {
-        let mut queue = queue();
+        let queue = SimpleTaskQueue::new();
 
         queue.submit_task(task("task-1")).unwrap();
 
@@ -121,7 +168,7 @@ mod tests {
 
     #[test]
     fn pop_task_marks_status_as_running() {
-        let mut queue = queue();
+        let queue = SimpleTaskQueue::new();
         queue.submit_task(task("task-1")).unwrap();
 
         let task = queue.pop_task().unwrap();
@@ -135,7 +182,7 @@ mod tests {
 
     #[test]
     fn running_task_can_be_marked_success() {
-        let mut queue = queue();
+        let queue = SimpleTaskQueue::new();
         queue.submit_task(task("task-1")).unwrap();
 
         assert_eq!(
@@ -160,7 +207,7 @@ mod tests {
 
     #[test]
     fn running_task_can_be_marked_failed() {
-        let mut queue = queue();
+        let queue = SimpleTaskQueue::new();
         queue.submit_task(task("task-1")).unwrap();
 
         assert_eq!(
@@ -185,7 +232,7 @@ mod tests {
 
     #[test]
     fn submit_task_rejects_duplicate_id() {
-        let mut queue = queue();
+        let queue = SimpleTaskQueue::new();
         queue.submit_task(task("task-1")).unwrap();
 
         assert!(matches!(
