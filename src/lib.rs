@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -37,6 +39,44 @@ pub enum TaskState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TaskStatus {
+    state: TaskState,
+    created_at: i64,
+    running_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+impl TaskStatus {
+    pub fn state(&self) -> TaskState {
+        self.state
+    }
+
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
+
+    pub fn finished_at(&self) -> Option<i64> {
+        self.finished_at
+    }
+
+    fn init() -> TaskStatus {
+        TaskStatus {
+            state: TaskState::Queued,
+            created_at: now_millis(),
+            running_at: None,
+            finished_at: None,
+        }
+    }
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before unix epoch")
+        .as_millis() as i64
+}
+
 #[derive(Error, Debug)]
 pub enum TaskError {
     #[error("task id not found")]
@@ -48,7 +88,7 @@ pub enum TaskError {
 pub trait TaskQueue {
     fn submit_task(&self, task: Task) -> Result<(), TaskError>;
 
-    fn get_task_status(&self, task_id: TaskId) -> Result<TaskState, TaskError>;
+    fn get_task_status(&self, task_id: TaskId) -> Result<TaskStatus, TaskError>;
 
     fn pop_task(&self) -> Option<Task>;
 
@@ -58,7 +98,7 @@ pub trait TaskQueue {
 }
 
 pub struct SimpleTaskQueue {
-    status_map: DashMap<TaskId, TaskState>,
+    status_map: DashMap<TaskId, TaskStatus>,
     wait_queue: SegQueue<Task>,
 }
 
@@ -74,14 +114,14 @@ impl SimpleTaskQueue {
         match self.status_map.entry(task.id.clone()) {
             Entry::Occupied(_) => Err(TaskError::Duplicate),
             Entry::Vacant(entry) => {
-                entry.insert(TaskState::Queued);
+                entry.insert(TaskStatus::init());
                 self.wait_queue.push(task);
                 Ok(())
             }
         }
     }
 
-    pub fn get_task_status(&self, task_id: impl AsRef<str>) -> Result<TaskState, TaskError> {
+    pub fn get_task_status(&self, task_id: impl AsRef<str>) -> Result<TaskStatus, TaskError> {
         self.status_map
             .get(task_id.as_ref())
             .map(|state| *state)
@@ -90,28 +130,30 @@ impl SimpleTaskQueue {
 
     pub fn pop_task(&self) -> Option<Task> {
         self.wait_queue.pop().inspect(|t| {
-            self.status_map.insert(t.id.clone(), TaskState::Running);
+            if let Some(mut status) = self.status_map.get_mut(&t.id) {
+                status.state = TaskState::Running;
+                status.running_at = Some(now_millis());
+            }
         })
     }
 
     pub fn mark_task_success(&self, task_id: impl AsRef<str>) {
-        self.status_map.alter(task_id.as_ref(), |_key, old_state| {
-            if old_state == TaskState::Running {
-                TaskState::Success
-            } else {
-                old_state
-            }
-        });
+        if let Some(mut status) = self.status_map.get_mut(task_id.as_ref()) {
+            finish_task(&mut status, TaskState::Success);
+        }
     }
 
     pub fn mark_task_failed(&self, task_id: impl AsRef<str>) {
-        self.status_map.alter(task_id.as_ref(), |_key, old_state| {
-            if old_state == TaskState::Running {
-                TaskState::Failed
-            } else {
-                old_state
-            }
-        });
+        if let Some(mut status) = self.status_map.get_mut(task_id.as_ref()) {
+            finish_task(&mut status, TaskState::Failed);
+        }
+    }
+}
+
+fn finish_task(status: &mut TaskStatus, finished_state: TaskState) {
+    if status.state == TaskState::Running {
+        status.state = finished_state;
+        status.finished_at = Some(now_millis());
     }
 }
 
@@ -126,7 +168,7 @@ impl TaskQueue for SimpleTaskQueue {
         SimpleTaskQueue::submit_task(self, task)
     }
 
-    fn get_task_status(&self, task_id: TaskId) -> Result<TaskState, TaskError> {
+    fn get_task_status(&self, task_id: TaskId) -> Result<TaskStatus, TaskError> {
         SimpleTaskQueue::get_task_status(self, task_id)
     }
 
@@ -161,7 +203,7 @@ mod tests {
         queue.submit_task(task("task-1")).unwrap();
 
         assert_eq!(
-            queue.get_task_status("task-1".to_string()).unwrap(),
+            queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Queued
         );
     }
@@ -175,7 +217,7 @@ mod tests {
 
         assert_eq!(task.id, "task-1");
         assert_eq!(
-            queue.get_task_status("task-1".to_string()).unwrap(),
+            queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Running
         );
     }
@@ -186,21 +228,21 @@ mod tests {
         queue.submit_task(task("task-1")).unwrap();
 
         assert_eq!(
-            queue.get_task_status("task-1".to_string()).unwrap(),
+            queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Queued
         );
 
         queue.pop_task().unwrap();
 
         assert_eq!(
-            queue.get_task_status("task-1".to_string()).unwrap(),
+            queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Running
         );
 
         queue.mark_task_success("task-1".to_string());
 
         assert_eq!(
-            queue.get_task_status("task-1".to_string()).unwrap(),
+            queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Success
         );
     }
@@ -211,21 +253,21 @@ mod tests {
         queue.submit_task(task("task-1")).unwrap();
 
         assert_eq!(
-            queue.get_task_status("task-1".to_string()).unwrap(),
+            queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Queued
         );
 
         queue.pop_task().unwrap();
 
         assert_eq!(
-            queue.get_task_status("task-1".to_string()).unwrap(),
+            queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Running
         );
 
         queue.mark_task_failed("task-1".to_string());
 
         assert_eq!(
-            queue.get_task_status("task-1".to_string()).unwrap(),
+            queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Failed
         );
     }
@@ -241,8 +283,47 @@ mod tests {
         ));
 
         assert_eq!(
-            queue.get_task_status("task-1".to_string()).unwrap(),
+            queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Queued
         );
+    }
+
+    #[test]
+    fn submitted_task_records_created_at_without_finished_at() {
+        let queue = SimpleTaskQueue::new();
+        let before_submit = now_millis();
+
+        queue.submit_task(task("task-1")).unwrap();
+
+        let status = queue.get_task_status("task-1".to_string()).unwrap();
+        assert_eq!(status.state(), TaskState::Queued);
+        assert!(status.created_at() >= before_submit);
+        assert!(status.finished_at().is_none());
+    }
+
+    #[test]
+    fn successful_task_records_finished_at() {
+        let queue = SimpleTaskQueue::new();
+        queue.submit_task(task("task-1")).unwrap();
+        queue.pop_task().unwrap();
+
+        queue.mark_task_success("task-1".to_string());
+
+        let status = queue.get_task_status("task-1".to_string()).unwrap();
+        assert_eq!(status.state(), TaskState::Success);
+        assert!(status.finished_at().unwrap() >= status.created_at());
+    }
+
+    #[test]
+    fn failed_task_records_finished_at() {
+        let queue = SimpleTaskQueue::new();
+        queue.submit_task(task("task-1")).unwrap();
+        queue.pop_task().unwrap();
+
+        queue.mark_task_failed("task-1".to_string());
+
+        let status = queue.get_task_status("task-1".to_string()).unwrap();
+        assert_eq!(status.state(), TaskState::Failed);
+        assert!(status.finished_at().unwrap() >= status.created_at());
     }
 }

@@ -62,16 +62,15 @@ fn public_queue_api_supports_multiple_producers_and_consumers() {
     assert_eq!(produced.load(Ordering::Acquire), total_tasks);
     assert_eq!(consumed.load(Ordering::Acquire), total_tasks);
 
-    assert_eq!(
-        queue
-            .get_task_status("producer-0-task-0".to_owned())
-            .unwrap(),
-        TaskState::Success
-    );
-    assert_eq!(
-        queue
-            .get_task_status("producer-3-task-249".to_owned())
-            .unwrap(),
-        TaskState::Success
-    );
+    let first_status = queue
+        .get_task_status("producer-0-task-0".to_owned())
+        .unwrap();
+    assert_eq!(first_status.state(), TaskState::Success);
+    assert!(first_status.finished_at().is_some());
+
+    let last_status = queue
+        .get_task_status("producer-3-task-249".to_owned())
+        .unwrap();
+    assert_eq!(last_status.state(), TaskState::Success);
+    assert!(last_status.finished_at().is_some());
 }
