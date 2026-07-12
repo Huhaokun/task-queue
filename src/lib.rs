@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crossbeam::queue::SegQueue;
+use crossbeam::channel::{Receiver, Sender, TrySendError};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use thiserror::Error;
@@ -56,6 +56,10 @@ impl TaskStatus {
         self.created_at
     }
 
+    pub fn running_at(&self) -> Option<i64> {
+        self.running_at
+    }
+
     pub fn finished_at(&self) -> Option<i64> {
         self.finished_at
     }
@@ -83,6 +87,10 @@ pub enum TaskError {
     NotFound,
     #[error("duplicate task id")]
     Duplicate,
+    #[error("task queue is full")]
+    QueueFulled,
+    #[error("task queue is closed")]
+    Disconnected,
 }
 
 pub trait TaskQueue {
@@ -99,24 +107,44 @@ pub trait TaskQueue {
 
 pub struct SimpleTaskQueue {
     status_map: DashMap<TaskId, TaskStatus>,
-    wait_queue: SegQueue<Task>,
+    sender: Sender<Task>,
+    receiver: Receiver<Task>,
 }
 
 impl SimpleTaskQueue {
-    pub fn new() -> SimpleTaskQueue {
+    pub fn new_with_capacity(capacity: usize) -> SimpleTaskQueue {
+        let (sender, receiver) = crossbeam::channel::bounded::<Task>(capacity);
         SimpleTaskQueue {
             status_map: DashMap::new(),
-            wait_queue: SegQueue::new(),
+            sender,
+            receiver,
         }
     }
 
+    pub fn new() -> SimpleTaskQueue {
+        const DEFAULT_CAPACITY: usize = 1024;
+        SimpleTaskQueue::new_with_capacity(DEFAULT_CAPACITY)
+    }
+
     pub fn submit_task(&self, task: Task) -> Result<(), TaskError> {
-        match self.status_map.entry(task.id.clone()) {
+        let task_id = task.id.clone();
+
+        match self.status_map.entry(task_id.clone()) {
             Entry::Occupied(_) => Err(TaskError::Duplicate),
             Entry::Vacant(entry) => {
                 entry.insert(TaskStatus::init());
-                self.wait_queue.push(task);
-                Ok(())
+
+                match self.sender.try_send(task) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(_)) => {
+                        self.status_map.remove(&task_id);
+                        Err(TaskError::QueueFulled)
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        self.status_map.remove(&task_id);
+                        Err(TaskError::Disconnected)
+                    }
+                }
             }
         }
     }
@@ -129,12 +157,16 @@ impl SimpleTaskQueue {
     }
 
     pub fn pop_task(&self) -> Option<Task> {
-        self.wait_queue.pop().inspect(|t| {
-            if let Some(mut status) = self.status_map.get_mut(&t.id) {
-                status.state = TaskState::Running;
-                status.running_at = Some(now_millis());
+        match self.receiver.try_recv() {
+            Ok(t) => {
+                if let Some(mut status) = self.status_map.get_mut(&t.id) {
+                    status.state = TaskState::Running;
+                    status.running_at = Some(now_millis());
+                }
+                Some(t)
             }
-        })
+            Err(_) => None,
+        }
     }
 
     pub fn mark_task_success(&self, task_id: impl AsRef<str>) {
@@ -286,6 +318,21 @@ mod tests {
             queue.get_task_status("task-1".to_string()).unwrap().state(),
             TaskState::Queued
         );
+    }
+
+    #[test]
+    fn submit_task_rejects_when_queue_is_full_without_status_leak() {
+        let queue = SimpleTaskQueue::new_with_capacity(1);
+        queue.submit_task(task("task-1")).unwrap();
+
+        assert!(matches!(
+            queue.submit_task(task("task-2")),
+            Err(TaskError::QueueFulled)
+        ));
+        assert!(matches!(
+            queue.get_task_status("task-2".to_string()),
+            Err(TaskError::NotFound)
+        ));
     }
 
     #[test]

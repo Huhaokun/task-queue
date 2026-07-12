@@ -1,9 +1,11 @@
 # A Simple Task Queue
 
 ### Key Features
-- [ ] task submit and consumption thread-safe
-- [ ] deduplicate with task_id
-- [ ] record task created_at and finished_at
+- [x] task submit and consumption thread-safe
+- [x] deduplicate with task_id
+- [x] record task status 
+- [ ] auto back-pressure
+- [ ] support self-define type task
 - [ ] single-process with multi-thread support and distributed mode (backend by redis)
 - [ ] timeout handle strategy
 - [ ] metrics and tracing
