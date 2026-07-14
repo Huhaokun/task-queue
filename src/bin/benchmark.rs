@@ -159,7 +159,7 @@ fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResult {
                     break local_payload_bytes;
                 }
 
-                let task = queue.pop_task();
+                let task = queue.try_pop_task();
 
                 if let Some(task) = task {
                     local_payload_bytes += task.payload().len();
