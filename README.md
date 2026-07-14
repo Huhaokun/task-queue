@@ -9,6 +9,7 @@
 - [x] completed task status will be cleaned if reach ttl
 - [ ] single-process with multi-thread support and distributed mode (backend by redis / postgre / mysql)
 - [x] zombie task detection
+- [ ] seperate idempotency key and task id
 - [ ] metrics and tracing
 - [ ] task with priority
 - [ ] task cancelation
