@@ -2,17 +2,36 @@
 
 ### Key Features
 - [x] task submit and consumption thread-safe
-- [x] deduplicate with task_id
+- [x] internally generated unique `i64` task IDs
+- [x] optional deduplication with a separate task key
 - [x] record task status 
 - [x] auto back-pressure
 - [x] support self-define type task
 - [x] completed task status will be cleaned if reach ttl
 - [ ] single-process with multi-thread support and distributed mode (backend by redis / postgre / mysql)
 - [x] zombie task detection
-- [ ] seperate idempotency key and task id
 - [ ] metrics and tracing
 - [ ] task with priority
 - [ ] task cancelation
+
+### Usage
+
+```rust
+use task_queue::SimpleTaskQueue;
+
+let queue: SimpleTaskQueue<&str> = SimpleTaskQueue::new();
+
+// Without a key, every submission creates a new task.
+let task_id = queue.submit_task("payload")?;
+
+// Supplying a key enables deduplication for that task.
+let keyed_task_id = queue.submit_task_with_key("request-123", "payload")?;
+
+// The task key type is generic; String is only the default.
+let numeric_key_queue = SimpleTaskQueue::<&str, u64>::new();
+numeric_key_queue.submit_task_with_key(123_u64, "payload")?;
+# Ok::<(), task_queue::TaskError>(())
+```
 
 ### Benchmark
 

@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use task_queue::{SimpleTaskQueue, Task};
+use task_queue::SimpleTaskQueue;
 
 #[derive(Clone, Copy, Debug)]
 struct BenchmarkConfig {
@@ -119,7 +119,7 @@ fn usage() -> &'static str {
 }
 
 fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResult {
-    let queue = Arc::new(SimpleTaskQueue::new());
+    let queue = Arc::new(SimpleTaskQueue::<Vec<u8>>::new());
     let start = Arc::new(Barrier::new(config.producers + config.consumers + 1));
     let produced = Arc::new(AtomicUsize::new(0));
     let consumed = Arc::new(AtomicUsize::new(0));
@@ -136,11 +136,8 @@ fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResult {
         producer_handles.push(thread::spawn(move || {
             start.wait();
 
-            for task_index in task_range {
-                let task_id = format!("task-{task_index}");
-                queue
-                    .submit_task(Task::new(task_id, payload.clone()))
-                    .unwrap();
+            for _ in task_range {
+                queue.submit_task(payload.clone()).unwrap();
                 produced.fetch_add(1, Ordering::Release);
             }
         }));
@@ -166,7 +163,7 @@ fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResult {
 
                 if let Some(task) = task {
                     local_payload_bytes += task.payload().len();
-                    queue.mark_task_success(task.id().to_owned());
+                    queue.mark_task_success(task.id());
 
                     if consumed.fetch_add(1, Ordering::AcqRel) + 1 >= total_tasks {
                         break local_payload_bytes;
