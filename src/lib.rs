@@ -120,7 +120,9 @@ pub trait TaskQueue<T, K = String> {
 
     fn get_task_status(&self, task_id: TaskId) -> Result<TaskStatus, TaskError>;
 
-    fn pop_task(&self) -> Option<Task<T, K>>;
+    fn try_pop_task(&self) -> Option<Task<T, K>>;
+
+    fn pop_task(&self) -> Result<Task<T, K>, TaskError>;
 
     fn mark_task_success(&self, task_id: TaskId);
 
@@ -248,16 +250,26 @@ where
             .ok_or(TaskError::NotFound)
     }
 
-    pub fn pop_task(&self) -> Option<Task<T, K>> {
+    pub fn try_pop_task(&self) -> Option<Task<T, K>> {
         match self.receiver.try_recv() {
             Ok(t) => {
-                if let Some(mut status) = self.status_map.get_mut(&t.id) {
-                    status.state = TaskState::Running;
-                    status.running_at = Some(now_millis());
-                }
+                self.mark_task_running(t.id);
                 Some(t)
             }
             Err(_) => None,
+        }
+    }
+
+    pub fn pop_task(&self) -> Result<Task<T, K>, TaskError> {
+        let t = self.receiver.recv().map_err(|_| TaskError::Disconnected)?;
+        self.mark_task_running(t.id);
+        Ok(t)
+    }
+
+    fn mark_task_running(&self, task_id: TaskId) {
+        if let Some(mut status) = self.status_map.get_mut(&task_id) {
+            status.state = TaskState::Running;
+            status.running_at = Some(now_millis());
         }
     }
 
@@ -406,7 +418,11 @@ where
         SimpleTaskQueue::get_task_status(self, task_id)
     }
 
-    fn pop_task(&self) -> Option<Task<T, K>> {
+    fn try_pop_task(&self) -> Option<Task<T, K>> {
+        SimpleTaskQueue::try_pop_task(self)
+    }
+
+    fn pop_task(&self) -> Result<Task<T, K>, TaskError> {
         SimpleTaskQueue::pop_task(self)
     }
 
@@ -448,7 +464,7 @@ mod tests {
     fn pop_task_exposes_generated_id_and_marks_status_as_running() {
         let queue = SimpleTaskQueue::<_, String>::new();
         let task_id = queue.submit_task(vec![42]).unwrap();
-        let task = queue.pop_task().unwrap();
+        let task = queue.try_pop_task().unwrap();
 
         assert_eq!(task.id(), task_id);
         assert_eq!(task.payload(), &vec![42]);
@@ -460,13 +476,47 @@ mod tests {
     }
 
     #[test]
+    fn pop_task_blocks_until_a_task_is_submitted() {
+        let queue = Arc::new(SimpleTaskQueue::<u8, String>::new());
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+
+        thread::scope(|scope| {
+            let consumer_queue = Arc::clone(&queue);
+            scope.spawn(move || {
+                ready_sender.send(()).unwrap();
+                result_sender
+                    .send(consumer_queue.pop_task().map(|task| task.id()))
+                    .unwrap();
+            });
+
+            ready_receiver.recv().unwrap();
+            assert!(matches!(
+                result_receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+
+            let task_id = queue.submit_task(42).unwrap();
+            let popped_id = result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            assert_eq!(popped_id, task_id);
+            assert_eq!(
+                queue.get_task_status(task_id).unwrap().state(),
+                TaskState::Running
+            );
+        });
+    }
+
+    #[test]
     fn running_tasks_can_be_finished() {
         let queue = SimpleTaskQueue::<_, String>::new();
         let success_id = queue.submit_task(Vec::<u8>::new()).unwrap();
         let failed_id = queue.submit_task(Vec::<u8>::new()).unwrap();
-        queue.pop_task().unwrap();
+        queue.try_pop_task().unwrap();
         queue.mark_task_success(success_id);
-        queue.pop_task().unwrap();
+        queue.try_pop_task().unwrap();
         queue.mark_task_failed(failed_id);
 
         assert_eq!(
@@ -503,7 +553,7 @@ mod tests {
             queue.get_task_status(task_id).unwrap().state(),
             TaskState::Queued
         );
-        let task = queue.pop_task().unwrap();
+        let task = queue.try_pop_task().unwrap();
         assert_eq!(task.task_key().map(String::as_str), Some("request-1"));
     }
 
@@ -516,7 +566,7 @@ mod tests {
             queue.submit_task_with_key(42_u64, Vec::new()),
             Err(TaskError::DuplicateTaskKey)
         ));
-        let task = queue.pop_task().unwrap();
+        let task = queue.try_pop_task().unwrap();
         assert_eq!(task.id(), task_id);
         assert_eq!(task.task_key(), Some(&42_u64));
     }
@@ -558,7 +608,7 @@ mod tests {
         ));
         assert!(queue.task_keys.get("retryable").is_none());
 
-        queue.pop_task().unwrap();
+        queue.try_pop_task().unwrap();
         assert!(
             queue
                 .submit_task_with_key("retryable", Vec::<u8>::new())
@@ -582,7 +632,7 @@ mod tests {
     fn successful_task_records_finished_at() {
         let queue = SimpleTaskQueue::<_, String>::new();
         let task_id = queue.submit_task(Vec::<u8>::new()).unwrap();
-        queue.pop_task().unwrap();
+        queue.try_pop_task().unwrap();
         queue.mark_task_success(task_id);
 
         let status = queue.get_task_status(task_id).unwrap();
@@ -639,7 +689,7 @@ mod tests {
         let task_id = queue
             .submit_task_with_key("reusable-after-ttl", Vec::<u8>::new())
             .unwrap();
-        let task = queue.pop_task().unwrap();
+        let task = queue.try_pop_task().unwrap();
         queue.mark_task_success(task.id());
 
         for _ in 0..100 {
@@ -700,7 +750,7 @@ mod tests {
             Duration::from_millis(1),
         );
         queue.submit_task(Vec::<u8>::new()).unwrap();
-        let task = queue.pop_task().unwrap();
+        let task = queue.try_pop_task().unwrap();
 
         for _ in 0..100 {
             let status = queue.get_task_status(task.id()).unwrap();

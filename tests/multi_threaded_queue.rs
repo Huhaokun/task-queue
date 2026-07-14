@@ -46,7 +46,7 @@ fn public_queue_api_supports_multiple_producers_and_consumers() {
                 start.wait();
 
                 while consumed.load(Ordering::Acquire) < total_tasks {
-                    let task = queue.pop_task();
+                    let task = queue.try_pop_task();
 
                     if let Some(task) = task {
                         queue.mark_task_success(task.id());
