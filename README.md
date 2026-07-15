@@ -2,6 +2,7 @@
 
 ### Key Features
 - [x] task submit and consumption thread-safe
+- [x] async task consumption without blocking runtime workers
 - [x] internally generated unique `i64` task IDs
 - [x] optional deduplication with a separate task key
 - [x] record task status 
@@ -26,6 +27,9 @@ let task_id = queue.submit_task("payload")?;
 
 // Supplying a key enables deduplication for that task.
 let keyed_task_id = queue.submit_task_with_key("request-123", "payload")?;
+
+// Wait asynchronously until a task is available.
+let task = queue.pop_task().await?;
 
 // The task key type is generic; String is only the default.
 let numeric_key_queue = SimpleTaskQueue::<&str, u64>::new();

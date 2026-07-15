@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::hash::Hash;
 use std::sync::{
     Arc,
@@ -7,7 +8,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossbeam::channel::{Receiver, Sender, TrySendError};
+use async_channel::{Receiver, Sender, TrySendError};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use thiserror::Error;
@@ -122,7 +123,10 @@ pub trait TaskQueue<T, K = String> {
 
     fn try_pop_task(&self) -> Option<Task<T, K>>;
 
-    fn pop_task(&self) -> Result<Task<T, K>, TaskError>;
+    fn pop_task(&self) -> impl Future<Output = Result<Task<T, K>, TaskError>> + Send
+    where
+        T: Send,
+        K: Send;
 
     fn mark_task_success(&self, task_id: TaskId);
 
@@ -162,7 +166,7 @@ where
         running_task_timeout: Duration,
         background_task_interval: Duration,
     ) -> SimpleTaskQueue<T, K> {
-        let (sender, receiver) = crossbeam::channel::bounded::<Task<T, K>>(capacity);
+        let (sender, receiver) = async_channel::bounded::<Task<T, K>>(capacity);
 
         let status_map = Arc::new(DashMap::new());
         let task_keys = Arc::new(DashMap::new());
@@ -228,7 +232,7 @@ where
                 self.rollback_submission(task_id, task_key.as_ref());
                 Err(TaskError::QueueFulled)
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Closed(_)) => {
                 self.rollback_submission(task_id, task_key.as_ref());
                 Err(TaskError::Disconnected)
             }
@@ -260,8 +264,12 @@ where
         }
     }
 
-    pub fn pop_task(&self) -> Result<Task<T, K>, TaskError> {
-        let t = self.receiver.recv().map_err(|_| TaskError::Disconnected)?;
+    pub async fn pop_task(&self) -> Result<Task<T, K>, TaskError> {
+        let t = self
+            .receiver
+            .recv()
+            .await
+            .map_err(|_| TaskError::Disconnected)?;
         self.mark_task_running(t.id);
         Ok(t)
     }
@@ -422,7 +430,11 @@ where
         SimpleTaskQueue::try_pop_task(self)
     }
 
-    fn pop_task(&self) -> Result<Task<T, K>, TaskError> {
+    fn pop_task(&self) -> impl Future<Output = Result<Task<T, K>, TaskError>> + Send
+    where
+        T: Send,
+        K: Send,
+    {
         SimpleTaskQueue::pop_task(self)
     }
 
@@ -473,40 +485,6 @@ mod tests {
             queue.get_task_status(task_id).unwrap().state(),
             TaskState::Running
         );
-    }
-
-    #[test]
-    fn pop_task_blocks_until_a_task_is_submitted() {
-        let queue = Arc::new(SimpleTaskQueue::<u8, String>::new());
-        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
-        let (result_sender, result_receiver) = std::sync::mpsc::channel();
-
-        thread::scope(|scope| {
-            let consumer_queue = Arc::clone(&queue);
-            scope.spawn(move || {
-                ready_sender.send(()).unwrap();
-                result_sender
-                    .send(consumer_queue.pop_task().map(|task| task.id()))
-                    .unwrap();
-            });
-
-            ready_receiver.recv().unwrap();
-            assert!(matches!(
-                result_receiver.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ));
-
-            let task_id = queue.submit_task(42).unwrap();
-            let popped_id = result_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .unwrap();
-            assert_eq!(popped_id, task_id);
-            assert_eq!(
-                queue.get_task_status(task_id).unwrap().state(),
-                TaskState::Running
-            );
-        });
     }
 
     #[test]

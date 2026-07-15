@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-channel = "2.5"
 dashmap = "6.2.1"
 thiserror = "2.0.18"
-crossbeam = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["macros", "rt", "time"] }
