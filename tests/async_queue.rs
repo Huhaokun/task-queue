@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use task_queue::{SimpleTaskQueue, TaskState};
+use taskq::{SimpleTaskQueue, TaskState};
 
 #[tokio::test]
 async fn pop_task_awaits_without_blocking_the_runtime() {

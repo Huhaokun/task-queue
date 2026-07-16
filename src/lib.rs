@@ -1,3 +1,30 @@
+//! A small, thread-safe, in-memory task queue.
+//!
+//! `taskq` assigns every submitted task a queue-local [`TaskId`]. Submitting a
+//! task with an optional [`TaskKey`] additionally enables idempotency: the same
+//! key cannot be submitted again while its task is still tracked by the queue.
+//! Consumers can either poll with [`SimpleTaskQueue::try_pop_task`] or wait
+//! asynchronously with [`SimpleTaskQueue::pop_task`].
+//!
+//! # Example
+//!
+//! ```
+//! use taskq::{SimpleTaskQueue, TaskState};
+//!
+//! let queue = SimpleTaskQueue::<&str>::new();
+//! let task_id = queue.submit_task("send email")?;
+//!
+//! let task = queue.try_pop_task().expect("a task should be queued");
+//! assert_eq!(task.id(), task_id);
+//! assert_eq!(task.payload(), &"send email");
+//!
+//! queue.mark_task_success(task.id());
+//! assert_eq!(queue.get_task_status(task_id)?.state(), TaskState::Success);
+//! # Ok::<(), taskq::TaskError>(())
+//! ```
+
+#![warn(missing_docs)]
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::hash::Hash;
@@ -15,8 +42,18 @@ use thiserror::Error;
 
 /// Identifies a task uniquely within a queue instance.
 pub type TaskId = i64;
+
+/// A caller-provided idempotency key associated with a task.
+///
+/// `K` defaults to [`String`], but any type satisfying the bounds on
+/// [`SimpleTaskQueue`] can be used. A key remains reserved until the finished
+/// task is removed after its configured time to live.
 pub type TaskKey<K = String> = K;
 
+/// A task received from a queue.
+///
+/// A task contains its queue-generated ID, optional idempotency key, and the
+/// submitted payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Task<T, K = String> {
     id: TaskId,
@@ -33,31 +70,43 @@ impl<T, K> Task<T, K> {
         }
     }
 
+    /// Returns the queue-generated task ID.
     pub fn id(&self) -> TaskId {
         self.id
     }
 
+    /// Returns the task's idempotency key, if one was supplied.
     pub fn task_key(&self) -> Option<&K> {
         self.task_key.as_ref()
     }
 
+    /// Returns a shared reference to the task payload.
     pub fn payload(&self) -> &T {
         &self.payload
     }
 }
 
+/// The lifecycle state of a task.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TaskState {
+    /// The task has been submitted but not yet received by a consumer.
     Queued,
+    /// A consumer has received the task.
     Running,
+    /// The consumer marked the task as successfully completed.
     Success,
+    /// The task failed or exceeded the configured running timeout.
     Failed,
 }
 
+/// Returns whether a task state is terminal.
 pub fn is_finished(s: TaskState) -> bool {
     s == TaskState::Success || s == TaskState::Failed
 }
 
+/// A snapshot of a task's lifecycle state and timestamps.
+///
+/// All timestamps are milliseconds since the Unix epoch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TaskStatus {
     state: TaskState,
@@ -67,18 +116,22 @@ pub struct TaskStatus {
 }
 
 impl TaskStatus {
+    /// Returns the current lifecycle state.
     pub fn state(&self) -> TaskState {
         self.state
     }
 
+    /// Returns when the task was submitted, in Unix epoch milliseconds.
     pub fn created_at(&self) -> i64 {
         self.created_at
     }
 
+    /// Returns when a consumer received the task, in Unix epoch milliseconds.
     pub fn running_at(&self) -> Option<i64> {
         self.running_at
     }
 
+    /// Returns when the task reached a terminal state, in Unix epoch milliseconds.
     pub fn finished_at(&self) -> Option<i64> {
         self.finished_at
     }
@@ -100,39 +153,63 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
+/// An error returned by a task queue operation.
 #[derive(Error, Debug)]
 pub enum TaskError {
+    /// The task ID is unknown or its retained status has expired.
     #[error("task id not found")]
     NotFound,
+    /// The idempotency key is already reserved by another retained task.
     #[error("duplicate task key")]
     DuplicateTaskKey,
+    /// The queue cannot allocate another `i64` task ID.
     #[error("task id space exhausted")]
     TaskIdExhausted,
+    /// The bounded queue has no capacity for another task.
     #[error("task queue is full")]
-    QueueFulled,
+    QueueFull,
+    /// The queue channel has been closed.
     #[error("task queue is closed")]
     Disconnected,
 }
 
+/// Common operations implemented by a task queue.
+///
+/// This trait can be used by consumers that do not need to depend directly on
+/// [`SimpleTaskQueue`].
 pub trait TaskQueue<T, K = String> {
+    /// Submits a task without an idempotency key.
     fn submit_task(&self, payload: T) -> Result<TaskId, TaskError>;
 
+    /// Submits a task with an idempotency key.
     fn submit_task_with_key(&self, task_key: TaskKey<K>, payload: T) -> Result<TaskId, TaskError>;
 
+    /// Returns a snapshot of the status associated with `task_id`.
     fn get_task_status(&self, task_id: TaskId) -> Result<TaskStatus, TaskError>;
 
+    /// Attempts to receive a task without waiting.
+    ///
+    /// Returns `None` when no task is immediately available.
     fn try_pop_task(&self) -> Option<Task<T, K>>;
 
+    /// Waits asynchronously until a task is available.
     fn pop_task(&self) -> impl Future<Output = Result<Task<T, K>, TaskError>> + Send
     where
         T: Send,
         K: Send;
 
+    /// Marks a running task as successfully completed.
     fn mark_task_success(&self, task_id: TaskId);
 
+    /// Marks a running task as failed.
     fn mark_task_failed(&self, task_id: TaskId);
 }
 
+/// A bounded, thread-safe, in-memory task queue.
+///
+/// The queue uses a background thread to expire finished status records and to
+/// mark tasks that run for too long as failed. Dropping the queue stops and
+/// joins that background thread.
 pub struct SimpleTaskQueue<T, K = String> {
     status_map: Arc<DashMap<TaskId, TaskStatus>>,
     task_keys: Arc<DashMap<TaskKey<K>, TaskId>>,
@@ -147,12 +224,20 @@ impl<T, K> SimpleTaskQueue<T, K>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
 {
+    /// Creates a queue with the given bounded capacity and default maintenance settings.
+    ///
+    /// Finished tasks are retained for 60 seconds, running tasks time out after
+    /// 60 seconds, and background maintenance runs every 60 seconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero.
     pub fn new_with_capacity(capacity: usize) -> SimpleTaskQueue<T, K> {
         const DEFAULT_FINISHED_TASK_TTL: Duration = Duration::from_secs(60);
         const DEFAULT_RUNNING_TASK_TIMEOUT: Duration = Duration::from_secs(60);
         const DEFAULT_BACKGROUND_TASK_INTERVAL: Duration = Duration::from_secs(60);
 
-        SimpleTaskQueue::new_with_background_task_config(
+        SimpleTaskQueue::new_with_config(
             capacity,
             DEFAULT_FINISHED_TASK_TTL,
             DEFAULT_RUNNING_TASK_TIMEOUT,
@@ -160,7 +245,21 @@ where
         )
     }
 
-    pub fn new_with_background_task_config(
+    /// Creates a queue with explicit capacity and background maintenance settings.
+    ///
+    /// - `finished_task_ttl` controls how long terminal task statuses and their
+    ///   idempotency keys remain retained.
+    /// - `running_task_timeout` controls how long a task may remain
+    ///   [`TaskState::Running`] before being marked [`TaskState::Failed`].
+    /// - `background_task_interval` controls how often both checks run.
+    ///
+    /// Cleanup and timeout transitions can occur up to one maintenance interval
+    /// after the configured duration has elapsed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero.
+    pub fn new_with_config(
         capacity: usize,
         finished_task_ttl: Duration,
         running_task_timeout: Duration,
@@ -191,15 +290,53 @@ where
         }
     }
 
+    /// Creates a queue with capacity 1024 and default maintenance settings.
+    ///
+    /// See [`SimpleTaskQueue::new_with_capacity`] for the default retention,
+    /// timeout, and maintenance interval.
     pub fn new() -> SimpleTaskQueue<T, K> {
         const DEFAULT_CAPACITY: usize = 1024;
         SimpleTaskQueue::new_with_capacity(DEFAULT_CAPACITY)
     }
 
+    /// Submits a task without an idempotency key.
+    ///
+    /// Every successful call allocates a new [`TaskId`], even when the payload
+    /// is equal to a previously submitted payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::QueueFull`] when the bounded queue is full,
+    /// [`TaskError::Disconnected`] when its channel is closed, or
+    /// [`TaskError::TaskIdExhausted`] when no further task IDs can be allocated.
     pub fn submit_task(&self, payload: T) -> Result<TaskId, TaskError> {
         self.submit(payload, None)
     }
 
+    /// Submits a task with an idempotency key.
+    ///
+    /// The key is reserved until the task's terminal status expires. Submitting
+    /// the same key during that period returns [`TaskError::DuplicateTaskKey`].
+    /// The key can be supplied as any value convertible into `K`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use taskq::{SimpleTaskQueue, TaskError};
+    ///
+    /// let queue = SimpleTaskQueue::<&str, u64>::new();
+    /// queue.submit_task_with_key(42_u64, "first")?;
+    /// assert!(matches!(
+    ///     queue.submit_task_with_key(42_u64, "duplicate"),
+    ///     Err(TaskError::DuplicateTaskKey)
+    /// ));
+    /// # Ok::<(), TaskError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::DuplicateTaskKey`] for a retained key. It can also
+    /// return any error documented by [`SimpleTaskQueue::submit_task`].
     pub fn submit_task_with_key(
         &self,
         task_key: impl Into<TaskKey<K>>,
@@ -230,7 +367,7 @@ where
             Ok(()) => Ok(task_id),
             Err(TrySendError::Full(_)) => {
                 self.rollback_submission(task_id, task_key.as_ref());
-                Err(TaskError::QueueFulled)
+                Err(TaskError::QueueFull)
             }
             Err(TrySendError::Closed(_)) => {
                 self.rollback_submission(task_id, task_key.as_ref());
@@ -247,6 +384,12 @@ where
         }
     }
 
+    /// Returns a snapshot of the status associated with `task_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::NotFound`] when the ID is unknown or its finished
+    /// status has expired.
     pub fn get_task_status(&self, task_id: TaskId) -> Result<TaskStatus, TaskError> {
         self.status_map
             .get(&task_id)
@@ -254,6 +397,10 @@ where
             .ok_or(TaskError::NotFound)
     }
 
+    /// Attempts to receive the next task without waiting.
+    ///
+    /// Receiving a task changes its status to [`TaskState::Running`]. Returns
+    /// `None` if the queue is empty or disconnected.
     pub fn try_pop_task(&self) -> Option<Task<T, K>> {
         match self.receiver.try_recv() {
             Ok(t) => {
@@ -264,6 +411,30 @@ where
         }
     }
 
+    /// Waits asynchronously for the next task.
+    ///
+    /// Waiting does not block an async runtime worker. Receiving a task changes
+    /// its status to [`TaskState::Running`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use taskq::{SimpleTaskQueue, TaskError};
+    ///
+    /// # async fn consume() -> Result<(), TaskError> {
+    /// let queue = SimpleTaskQueue::<u32>::new();
+    /// queue.submit_task(7)?;
+    ///
+    /// let task = queue.pop_task().await?;
+    /// assert_eq!(task.payload(), &7);
+    /// queue.mark_task_success(task.id());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::Disconnected`] when the queue channel closes.
     pub async fn pop_task(&self) -> Result<Task<T, K>, TaskError> {
         let t = self
             .receiver
@@ -281,12 +452,20 @@ where
         }
     }
 
+    /// Marks a running task as successfully completed.
+    ///
+    /// This method does nothing if the task is unknown or is not currently
+    /// [`TaskState::Running`].
     pub fn mark_task_success(&self, task_id: TaskId) {
         if let Some(mut status) = self.status_map.get_mut(&task_id) {
             finish_task(&mut status, TaskState::Success);
         }
     }
 
+    /// Marks a running task as failed.
+    ///
+    /// This method does nothing if the task is unknown or is not currently
+    /// [`TaskState::Running`].
     pub fn mark_task_failed(&self, task_id: TaskId) {
         if let Some(mut status) = self.status_map.get_mut(&task_id) {
             finish_task(&mut status, TaskState::Failed);
@@ -582,7 +761,7 @@ mod tests {
 
         assert!(matches!(
             queue.submit_task_with_key("retryable", Vec::<u8>::new()),
-            Err(TaskError::QueueFulled)
+            Err(TaskError::QueueFull)
         ));
         assert!(queue.task_keys.get("retryable").is_none());
 
@@ -658,7 +837,7 @@ mod tests {
 
     #[test]
     fn background_cleanup_removes_finished_tasks_after_ttl() {
-        let queue = SimpleTaskQueue::<_, String>::new_with_background_task_config(
+        let queue = SimpleTaskQueue::<_, String>::new_with_config(
             1,
             Duration::from_millis(0),
             Duration::from_secs(60),
@@ -721,7 +900,7 @@ mod tests {
 
     #[test]
     fn background_task_fails_timed_out_running_task() {
-        let queue = SimpleTaskQueue::<_, String>::new_with_background_task_config(
+        let queue = SimpleTaskQueue::<_, String>::new_with_config(
             1,
             Duration::from_secs(60),
             Duration::from_millis(0),

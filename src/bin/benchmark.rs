@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use task_queue::SimpleTaskQueue;
+use taskq::SimpleTaskQueue;
 
 #[derive(Clone, Copy, Debug)]
 struct BenchmarkConfig {

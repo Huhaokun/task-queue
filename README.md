@@ -1,4 +1,4 @@
-# A Simple Task Queue
+# taskq
 
 ### Key Features
 - [x] task submit and consumption thread-safe
@@ -18,7 +18,7 @@
 ### Usage
 
 ```rust
-use task_queue::SimpleTaskQueue;
+use taskq::SimpleTaskQueue;
 
 let queue: SimpleTaskQueue<&str> = SimpleTaskQueue::new();
 
@@ -34,7 +34,7 @@ let task = queue.pop_task().await?;
 // The task key type is generic; String is only the default.
 let numeric_key_queue = SimpleTaskQueue::<&str, u64>::new();
 numeric_key_queue.submit_task_with_key(123_u64, "payload")?;
-# Ok::<(), task_queue::TaskError>(())
+# Ok::<(), taskq::TaskError>(())
 ```
 
 ### Benchmark

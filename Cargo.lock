@@ -185,7 +185,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "task-queue"
+name = "taskq"
 version = "0.1.0"
 dependencies = [
  "async-channel",

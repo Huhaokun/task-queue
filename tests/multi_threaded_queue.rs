@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::thread;
 
-use task_queue::{SimpleTaskQueue, TaskState};
+use taskq::{SimpleTaskQueue, TaskState};
 
 #[test]
 fn public_queue_api_supports_multiple_producers_and_consumers() {
