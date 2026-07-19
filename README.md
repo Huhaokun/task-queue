@@ -1,4 +1,4 @@
-# taskq
+# taskq A simple task queue
 
 ### Key Features
 - [x] task submit and consumption thread-safe
@@ -42,3 +42,8 @@ numeric_key_queue.submit_task_with_key(123_u64, "payload")?;
 ```bash
 cargo run --release --bin benchmark -- --producers 4 --consumers 4 --tasks 100000 --payload-bytes 128
 ```
+
+### License
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.
