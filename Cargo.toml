@@ -2,6 +2,14 @@
 name = "taskq"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A thread-safe in-memory task queue with async consumption and optional idempotency keys"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Huhaokun/task-queue"
+documentation = "https://docs.rs/taskq"
+readme = "README.md"
+keywords = ["task-queue", "async", "concurrency", "idempotency"]
+categories = ["asynchronous", "concurrency", "data-structures"]
 
 [dependencies]
 async-channel = "2.5"
