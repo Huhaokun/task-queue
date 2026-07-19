@@ -49,7 +49,7 @@ fn public_queue_api_supports_multiple_producers_and_consumers() {
                     let task = queue.try_pop_task();
 
                     if let Some(task) = task {
-                        queue.mark_task_success(task.id());
+                        queue.mark_task_success(task.id()).unwrap();
                         consumed.fetch_add(1, Ordering::AcqRel);
                     } else {
                         thread::yield_now();

@@ -18,7 +18,7 @@
 //! assert_eq!(task.id(), task_id);
 //! assert_eq!(task.payload(), &"send email");
 //!
-//! queue.mark_task_success(task.id());
+//! queue.mark_task_success(task.id())?;
 //! assert_eq!(queue.get_task_status(task_id)?.state(), TaskState::Success);
 //! # Ok::<(), taskq::TaskError>(())
 //! ```
@@ -83,6 +83,16 @@ impl<T, K> Task<T, K> {
     /// Returns a shared reference to the task payload.
     pub fn payload(&self) -> &T {
         &self.payload
+    }
+
+    /// Consumes the task and returns its payload.
+    pub fn into_payload(self) -> T {
+        self.payload
+    }
+
+    /// Consumes the task and returns its ID, optional key, and payload.
+    pub fn into_parts(self) -> (TaskId, Option<TaskKey<K>>, T) {
+        (self.id, self.task_key, self.payload)
     }
 }
 
@@ -168,6 +178,9 @@ pub enum TaskError {
     /// The bounded queue has no capacity for another task.
     #[error("task queue is full")]
     QueueFull,
+    /// The requested transition is invalid because the task is not running.
+    #[error("task is not running")]
+    InvalidTaskState,
     /// The queue channel has been closed.
     #[error("task queue is closed")]
     Disconnected,
@@ -199,10 +212,10 @@ pub trait TaskQueue<T, K = String> {
         K: Send;
 
     /// Marks a running task as successfully completed.
-    fn mark_task_success(&self, task_id: TaskId);
+    fn mark_task_success(&self, task_id: TaskId) -> Result<(), TaskError>;
 
     /// Marks a running task as failed.
-    fn mark_task_failed(&self, task_id: TaskId);
+    fn mark_task_failed(&self, task_id: TaskId) -> Result<(), TaskError>;
 }
 
 /// A bounded, thread-safe, in-memory task queue.
@@ -427,7 +440,7 @@ where
     ///
     /// let task = queue.pop_task().await?;
     /// assert_eq!(task.payload(), &7);
-    /// queue.mark_task_success(task.id());
+    /// queue.mark_task_success(task.id())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -454,22 +467,30 @@ where
 
     /// Marks a running task as successfully completed.
     ///
-    /// This method does nothing if the task is unknown or is not currently
-    /// [`TaskState::Running`].
-    pub fn mark_task_success(&self, task_id: TaskId) {
-        if let Some(mut status) = self.status_map.get_mut(&task_id) {
-            finish_task(&mut status, TaskState::Success);
-        }
+    /// # Errors
+    ///
+    /// Returns [`TaskError::NotFound`] when the task is unknown and
+    /// [`TaskError::InvalidTaskState`] when it is not currently running.
+    pub fn mark_task_success(&self, task_id: TaskId) -> Result<(), TaskError> {
+        let mut status = self
+            .status_map
+            .get_mut(&task_id)
+            .ok_or(TaskError::NotFound)?;
+        finish_task(&mut status, TaskState::Success)
     }
 
     /// Marks a running task as failed.
     ///
-    /// This method does nothing if the task is unknown or is not currently
-    /// [`TaskState::Running`].
-    pub fn mark_task_failed(&self, task_id: TaskId) {
-        if let Some(mut status) = self.status_map.get_mut(&task_id) {
-            finish_task(&mut status, TaskState::Failed);
-        }
+    /// # Errors
+    ///
+    /// Returns [`TaskError::NotFound`] when the task is unknown and
+    /// [`TaskError::InvalidTaskState`] when it is not currently running.
+    pub fn mark_task_failed(&self, task_id: TaskId) -> Result<(), TaskError> {
+        let mut status = self
+            .status_map
+            .get_mut(&task_id)
+            .ok_or(TaskError::NotFound)?;
+        finish_task(&mut status, TaskState::Failed)
     }
 }
 
@@ -573,11 +594,14 @@ impl<T, K> Drop for SimpleTaskQueue<T, K> {
     }
 }
 
-fn finish_task(status: &mut TaskStatus, finished_state: TaskState) {
-    if status.state == TaskState::Running {
-        status.state = finished_state;
-        status.finished_at = Some(now_millis());
+fn finish_task(status: &mut TaskStatus, finished_state: TaskState) -> Result<(), TaskError> {
+    if status.state != TaskState::Running {
+        return Err(TaskError::InvalidTaskState);
     }
+
+    status.state = finished_state;
+    status.finished_at = Some(now_millis());
+    Ok(())
 }
 
 impl<T, K> Default for SimpleTaskQueue<T, K>
@@ -617,12 +641,12 @@ where
         SimpleTaskQueue::pop_task(self)
     }
 
-    fn mark_task_success(&self, task_id: TaskId) {
-        SimpleTaskQueue::mark_task_success(self, task_id);
+    fn mark_task_success(&self, task_id: TaskId) -> Result<(), TaskError> {
+        SimpleTaskQueue::mark_task_success(self, task_id)
     }
 
-    fn mark_task_failed(&self, task_id: TaskId) {
-        SimpleTaskQueue::mark_task_failed(self, task_id);
+    fn mark_task_failed(&self, task_id: TaskId) -> Result<(), TaskError> {
+        SimpleTaskQueue::mark_task_failed(self, task_id)
     }
 }
 
@@ -672,9 +696,9 @@ mod tests {
         let success_id = queue.submit_task(Vec::<u8>::new()).unwrap();
         let failed_id = queue.submit_task(Vec::<u8>::new()).unwrap();
         queue.try_pop_task().unwrap();
-        queue.mark_task_success(success_id);
+        queue.mark_task_success(success_id).unwrap();
         queue.try_pop_task().unwrap();
-        queue.mark_task_failed(failed_id);
+        queue.mark_task_failed(failed_id).unwrap();
 
         assert_eq!(
             queue.get_task_status(success_id).unwrap().state(),
@@ -684,6 +708,28 @@ mod tests {
             queue.get_task_status(failed_id).unwrap().state(),
             TaskState::Failed
         );
+    }
+
+    #[test]
+    fn finishing_a_task_reports_invalid_ids_and_states() {
+        let queue = SimpleTaskQueue::<_, String>::new();
+        let task_id = queue.submit_task(Vec::<u8>::new()).unwrap();
+
+        assert!(matches!(
+            queue.mark_task_success(i64::MAX),
+            Err(TaskError::NotFound)
+        ));
+        assert!(matches!(
+            queue.mark_task_success(task_id),
+            Err(TaskError::InvalidTaskState)
+        ));
+
+        queue.try_pop_task().unwrap();
+        queue.mark_task_success(task_id).unwrap();
+        assert!(matches!(
+            queue.mark_task_failed(task_id),
+            Err(TaskError::InvalidTaskState)
+        ));
     }
 
     #[test]
@@ -726,6 +772,19 @@ mod tests {
         let task = queue.try_pop_task().unwrap();
         assert_eq!(task.id(), task_id);
         assert_eq!(task.task_key(), Some(&42_u64));
+    }
+
+    #[test]
+    fn task_can_be_consumed_into_payload_or_parts() {
+        let queue = SimpleTaskQueue::<Vec<u8>, u64>::new();
+        queue.submit_task(vec![1, 2, 3]).unwrap();
+        assert_eq!(queue.try_pop_task().unwrap().into_payload(), vec![1, 2, 3]);
+
+        let task_id = queue.submit_task_with_key(42_u64, vec![4, 5]).unwrap();
+        let (id, task_key, payload) = queue.try_pop_task().unwrap().into_parts();
+        assert_eq!(id, task_id);
+        assert_eq!(task_key, Some(42_u64));
+        assert_eq!(payload, vec![4, 5]);
     }
 
     #[test]
@@ -790,7 +849,7 @@ mod tests {
         let queue = SimpleTaskQueue::<_, String>::new();
         let task_id = queue.submit_task(Vec::<u8>::new()).unwrap();
         queue.try_pop_task().unwrap();
-        queue.mark_task_success(task_id);
+        queue.mark_task_success(task_id).unwrap();
 
         let status = queue.get_task_status(task_id).unwrap();
         assert_eq!(status.state(), TaskState::Success);
@@ -847,7 +906,7 @@ mod tests {
             .submit_task_with_key("reusable-after-ttl", Vec::<u8>::new())
             .unwrap();
         let task = queue.try_pop_task().unwrap();
-        queue.mark_task_success(task.id());
+        queue.mark_task_success(task.id()).unwrap();
 
         for _ in 0..100 {
             if matches!(queue.get_task_status(task_id), Err(TaskError::NotFound)) {

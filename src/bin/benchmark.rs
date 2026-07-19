@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use taskq::SimpleTaskQueue;
+use taskq::{SimpleTaskQueue, TaskError};
 
 #[derive(Clone, Copy, Debug)]
 struct BenchmarkConfig {
@@ -18,6 +18,7 @@ struct BenchmarkConfig {
     consumers: usize,
     tasks: usize,
     payload_bytes: usize,
+    capacity: usize,
 }
 
 #[derive(Debug)]
@@ -35,6 +36,7 @@ impl Default for BenchmarkConfig {
             consumers: 4,
             tasks: 100_000,
             payload_bytes: 128,
+            capacity: 1024,
         }
     }
 }
@@ -64,6 +66,7 @@ fn main() {
     println!("consumers: {}", config.consumers);
     println!("tasks: {}", config.tasks);
     println!("payload_bytes: {}", config.payload_bytes);
+    println!("capacity: {}", config.capacity);
     println!("produced: {}", result.produced);
     println!("consumed: {}", result.consumed);
     println!("payload_bytes_consumed: {}", result.payload_bytes_consumed);
@@ -90,6 +93,9 @@ impl BenchmarkConfig {
                 "--payload-bytes" => {
                     config.payload_bytes = parse_usize("--payload-bytes", args.next())?;
                 }
+                "--capacity" => {
+                    config.capacity = parse_positive_usize("--capacity", args.next())?;
+                }
                 _ => return Err(format!("unknown argument: {arg}")),
             }
         }
@@ -115,11 +121,13 @@ fn parse_usize(flag: &str, value: Option<String>) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: benchmark [--producers N] [--consumers N] [--tasks N] [--payload-bytes N]"
+    "usage: benchmark [--producers N] [--consumers N] [--tasks N] [--payload-bytes N] [--capacity N]"
 }
 
 fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResult {
-    let queue = Arc::new(SimpleTaskQueue::<Vec<u8>>::new());
+    let queue = Arc::new(SimpleTaskQueue::<Vec<u8>>::new_with_capacity(
+        config.capacity,
+    ));
     let start = Arc::new(Barrier::new(config.producers + config.consumers + 1));
     let produced = Arc::new(AtomicUsize::new(0));
     let consumed = Arc::new(AtomicUsize::new(0));
@@ -137,7 +145,7 @@ fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResult {
             start.wait();
 
             for _ in task_range {
-                queue.submit_task(payload.clone()).unwrap();
+                submit_with_retry(&queue, &payload);
                 produced.fetch_add(1, Ordering::Release);
             }
         }));
@@ -163,7 +171,7 @@ fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResult {
 
                 if let Some(task) = task {
                     local_payload_bytes += task.payload().len();
-                    queue.mark_task_success(task.id());
+                    queue.mark_task_success(task.id()).unwrap();
 
                     if consumed.fetch_add(1, Ordering::AcqRel) + 1 >= total_tasks {
                         break local_payload_bytes;
@@ -195,6 +203,16 @@ fn run_benchmark(config: BenchmarkConfig) -> BenchmarkResult {
     }
 }
 
+fn submit_with_retry(queue: &SimpleTaskQueue<Vec<u8>>, payload: &[u8]) {
+    loop {
+        match queue.submit_task(payload.to_vec()) {
+            Ok(_) => return,
+            Err(TaskError::QueueFull) => thread::yield_now(),
+            Err(error) => panic!("task submission failed: {error}"),
+        }
+    }
+}
+
 fn task_range(producer_id: usize, producer_count: usize, total_tasks: usize) -> Range<usize> {
     let base = total_tasks / producer_count;
     let remainder = total_tasks % producer_count;
@@ -202,4 +220,42 @@ fn task_range(producer_id: usize, producer_count: usize, total_tasks: usize) -> 
     let len = base + usize::from(producer_id < remainder);
 
     start..start + len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_capacity() {
+        let config =
+            BenchmarkConfig::from_args(["--capacity".to_owned(), "32".to_owned()].into_iter())
+                .unwrap();
+
+        assert_eq!(config.capacity, 32);
+    }
+
+    #[test]
+    fn rejects_zero_capacity() {
+        let error =
+            BenchmarkConfig::from_args(["--capacity".to_owned(), "0".to_owned()].into_iter())
+                .unwrap_err();
+
+        assert_eq!(error, "--capacity must be greater than zero");
+    }
+
+    #[test]
+    fn retries_when_the_queue_is_full() {
+        let result = run_benchmark(BenchmarkConfig {
+            producers: 8,
+            consumers: 1,
+            tasks: 10_000,
+            payload_bytes: 8,
+            capacity: 8,
+        });
+
+        assert_eq!(result.produced, 10_000);
+        assert_eq!(result.consumed, 10_000);
+        assert_eq!(result.payload_bytes_consumed, 80_000);
+    }
 }
