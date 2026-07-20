@@ -20,6 +20,7 @@
 //!
 //! queue.mark_task_success(task.id())?;
 //! assert_eq!(queue.get_task_status(task_id)?.state(), TaskState::Success);
+//! assert!(queue.close());
 //! # Ok::<(), taskq::TaskError>(())
 //! ```
 
@@ -181,7 +182,7 @@ pub enum TaskError {
     /// The requested transition is invalid because the task is not running.
     #[error("task is not running")]
     InvalidTaskState,
-    /// The queue channel has been closed.
+    /// The queue is closed, so submission is rejected or no queued task remains.
     #[error("task queue is closed")]
     Disconnected,
 }
@@ -191,6 +192,14 @@ pub enum TaskError {
 /// This trait can be used by consumers that do not need to depend directly on
 /// [`SimpleTaskQueue`].
 pub trait TaskQueue<T, K = String> {
+    /// Closes the queue to new submissions while allowing queued tasks to drain.
+    ///
+    /// Returns `true` if this call closed the queue.
+    fn close(&self) -> bool;
+
+    /// Returns whether the queue has been closed to new submissions.
+    fn is_closed(&self) -> bool;
+
     /// Submits a task without an idempotency key.
     fn submit_task(&self, payload: T) -> Result<TaskId, TaskError>;
 
@@ -202,7 +211,9 @@ pub trait TaskQueue<T, K = String> {
 
     /// Attempts to receive a task without waiting.
     ///
-    /// Returns `None` when no task is immediately available.
+    /// Returns `None` when no task is immediately available, including when a
+    /// closed queue has been fully drained. Use [`TaskQueue::is_closed`] when
+    /// the distinction matters.
     fn try_pop_task(&self) -> Option<Task<T, K>>;
 
     /// Waits asynchronously until a task is available.
@@ -312,6 +323,26 @@ where
         SimpleTaskQueue::new_with_capacity(DEFAULT_CAPACITY)
     }
 
+    /// Closes the queue to new submissions.
+    ///
+    /// Tasks that were submitted before closing remain available to consumers.
+    /// Once those tasks have been drained, [`SimpleTaskQueue::pop_task`] returns
+    /// [`TaskError::Disconnected`]. Any consumers already waiting on an empty
+    /// queue are woken when it closes.
+    ///
+    /// Returns `true` if this call closed the queue and `false` if it was
+    /// already closed.
+    pub fn close(&self) -> bool {
+        self.sender.close()
+    }
+
+    /// Returns whether the queue has been closed to new submissions.
+    ///
+    /// A closed queue may still contain tasks that consumers can drain.
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
     /// Submits a task without an idempotency key.
     ///
     /// Every successful call allocates a new [`TaskId`], even when the payload
@@ -413,7 +444,8 @@ where
     /// Attempts to receive the next task without waiting.
     ///
     /// Receiving a task changes its status to [`TaskState::Running`]. Returns
-    /// `None` if the queue is empty or disconnected.
+    /// `None` if the queue is empty or has been closed and drained. Use
+    /// [`SimpleTaskQueue::is_closed`] to distinguish a closed queue.
     pub fn try_pop_task(&self) -> Option<Task<T, K>> {
         match self.receiver.try_recv() {
             Ok(t) => {
@@ -447,7 +479,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`TaskError::Disconnected`] when the queue channel closes.
+    /// Returns [`TaskError::Disconnected`] when the queue has been closed and
+    /// all previously submitted tasks have been drained.
     pub async fn pop_task(&self) -> Result<Task<T, K>, TaskError> {
         let t = self
             .receiver
@@ -584,6 +617,7 @@ fn duration_millis_i64(duration: Duration) -> i64 {
 
 impl<T, K> Drop for SimpleTaskQueue<T, K> {
     fn drop(&mut self) {
+        self.sender.close();
         self.keep_background_task_running
             .store(false, Ordering::Release);
 
@@ -617,6 +651,14 @@ impl<T, K> TaskQueue<T, K> for SimpleTaskQueue<T, K>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
 {
+    fn close(&self) -> bool {
+        SimpleTaskQueue::close(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        SimpleTaskQueue::is_closed(self)
+    }
+
     fn submit_task(&self, payload: T) -> Result<TaskId, TaskError> {
         SimpleTaskQueue::submit_task(self, payload)
     }
@@ -663,6 +705,39 @@ mod tests {
             queue.get_task_status(task_id).unwrap().state(),
             TaskState::Queued
         );
+    }
+
+    #[test]
+    fn close_is_idempotent_and_rejects_new_tasks() {
+        let queue = SimpleTaskQueue::<_, String>::new();
+
+        assert!(!queue.is_closed());
+        assert!(queue.close());
+        assert!(queue.is_closed());
+        assert!(!queue.close());
+        assert!(matches!(
+            queue.submit_task(Vec::<u8>::new()),
+            Err(TaskError::Disconnected)
+        ));
+        assert!(matches!(
+            queue.submit_task_with_key("closed-key", Vec::<u8>::new()),
+            Err(TaskError::Disconnected)
+        ));
+        assert!(queue.task_keys.get("closed-key").is_none());
+    }
+
+    #[test]
+    fn close_allows_queued_tasks_to_drain() {
+        let queue = SimpleTaskQueue::<_, String>::new();
+        let task_id = queue.submit_task(vec![42]).unwrap();
+
+        queue.close();
+
+        let task = queue.try_pop_task().unwrap();
+        assert_eq!(task.id(), task_id);
+        assert_eq!(task.payload(), &vec![42]);
+        queue.mark_task_success(task.id()).unwrap();
+        assert!(queue.try_pop_task().is_none());
     }
 
     #[test]

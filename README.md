@@ -16,6 +16,7 @@ or synchronous consumers.
 - [x] finished task cleanup after a configurable TTL
 - [x] running task timeout detection
 - [x] single-process, multi-threaded operation
+- [x] graceful, drain-before-disconnect queue closure
 - [ ] metrics and tracing
 - [ ] task priorities
 - [ ] task cancellation
@@ -47,6 +48,10 @@ async fn run() -> Result<(), TaskError> {
     assert_eq!(task.payload(), &"payload");
     queue.mark_task_success(task.id())?;
 
+    // Stop new submissions while allowing already queued tasks to drain.
+    assert!(queue.close());
+    assert!(queue.is_closed());
+
     // Task keys can use any supported hashable type.
     let numeric_key_queue = SimpleTaskQueue::<&str, u64>::new();
     numeric_key_queue.submit_task_with_key(123_u64, "payload")?;
@@ -69,6 +74,9 @@ consumer needs ownership of the payload.
 - A task key remains reserved until its terminal status is removed after the
   configured finished-task TTL.
 - `pop_task` waits asynchronously, while `try_pop_task` returns immediately.
+- `close` rejects new submissions, preserves already queued tasks for draining,
+  and wakes consumers waiting on an empty queue. After the queue is drained,
+  `pop_task` returns `TaskError::Disconnected`; `try_pop_task` returns `None`.
 - Tasks and statuses live only in memory and are lost when the process exits.
 - Every queue instance owns one background maintenance thread for status
   cleanup and running-task timeout detection.
